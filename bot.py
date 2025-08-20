@@ -30,7 +30,7 @@ async def run_web_server():
 # ---------- CONFIG ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 ADMIN_ENV_IDS = {
-    *[int(x) for x in os.getenv("1147798918973898762", "").replace(" ", "").split(",") if x]
+    *[int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x]
 }
 DB_PATH = os.getenv("DB_PATH", "shopbot.db")
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
