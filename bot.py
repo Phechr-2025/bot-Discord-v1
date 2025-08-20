@@ -10,12 +10,10 @@ from discord.ext import commands
 from discord import app_commands, Interaction
 from discord.ui import View, Select, Button
 
-# ดาวน์โหลดจาก Google Drive
 import gdown
-
-# ---- health check server สำหรับ Render (ต้อง bind $PORT) ----
 from aiohttp import web
 
+# ---------- Healthcheck for Render ----------
 async def _health(request):
     return web.Response(text="ok")
 
@@ -29,13 +27,13 @@ async def run_web_server():
     await site.start()
     print(f"[web] listening on :{port}")
 
-# -------------------- CONFIG --------------------
+# ---------- CONFIG ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-ADMIN_USER_IDS = {
-    *[int(x) for x in os.getenv("1147798918973898762", "").replace(" ", "").split(",") if x]
+ADMIN_ENV_IDS = {
+    *[int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x]
 }
 DB_PATH = os.getenv("DB_PATH", "shopbot.db")
-MAX_UPLOAD_BYTES = 24 * 1024 * 1024  # ~24MB
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
@@ -43,7 +41,7 @@ INTENTS.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
-# -------------------- UTIL --------------------
+# ---------- UTILS ----------
 def to_satang(thb: float) -> int:
     return int(round(thb * 100))
 
@@ -53,7 +51,7 @@ def fmt_thb(satang: int) -> str:
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-# -------------------- DB LAYER --------------------
+# ---------- DB ----------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -86,6 +84,12 @@ def db_init():
                 price_cents INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(item_id) REFERENCES items(id)
+            )
+        """)
+        # ตารางแอดมินเพิ่มเติม
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                discord_id INTEGER PRIMARY KEY
             )
         """)
         conn.commit()
@@ -156,13 +160,40 @@ def get_my_purchases(discord_id: int, limit: int = 20) -> List[sqlite3.Row]:
             WHERE p.discord_id=? ORDER BY p.id DESC LIMIT ?
         """, (discord_id, limit)).fetchall())
 
-# -------------------- DOWNLOAD / DELIVERY --------------------
+# ---------- Admin helpers ----------
+def is_admin_user(user_id: int) -> bool:
+    # จาก ENV
+    if user_id in ADMIN_ENV_IDS:
+        return True
+    # จากตาราง admins
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM admins WHERE discord_id=?", (user_id,)).fetchone()
+        if row:
+            return True
+    return False
+
+def is_admin(inter: Interaction) -> bool:
+    # เจ้าของกิลด์เป็นแอดมินเสมอ
+    guild_owner_ok = (inter.guild is not None and inter.user.id == inter.guild.owner_id)
+    return guild_owner_ok or is_admin_user(inter.user.id)
+
+def grant_admin(user_id: int):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO admins (discord_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def revoke_admin(user_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM admins WHERE discord_id=?", (user_id,))
+        conn.commit()
+
+# ---------- DOWNLOAD ----------
 async def download_drive_to_temp(url_or_id: str, filename_hint: str) -> Tuple[str, int]:
     def _download() -> Tuple[str, int]:
         tmpdir = tempfile.mkdtemp(prefix="shopclip_")
         out = os.path.join(tmpdir, filename_hint if filename_hint.endswith(".mp4")
                            else f"{filename_hint}.mp4")
-        # ต้องแชร์ไฟล์ Drive เป็น Anyone with the link
+        # ต้องแชร์ไฟล์เป็น Anyone with the link
         gdown.download(url_or_id, out, quiet=True, fuzzy=True)
         return out, os.path.getsize(out)
     return await asyncio.to_thread(_download)
@@ -179,7 +210,7 @@ async def send_video_or_link(user: discord.User, file_path: str, size_bytes: int
     except discord.Forbidden:
         pass
 
-# -------------------- UI --------------------
+# ---------- UI ----------
 class ShopSelect(Select):
     def __init__(self):
         rows = list_items(active_only=True)
@@ -235,13 +266,12 @@ class ConfirmBuyView(View):
             )
 
         await interaction.response.edit_message(content="กำลังเตรียมไฟล์ให้คุณ... ⏳", view=None)
-        # ตัดเงิน + บันทึก
         add_purchase(interaction.user.id, item["id"], price)
 
         try:
             path, size = await download_drive_to_temp(item["gdrive_url"], item["filename"] or "video.mp4")
         except Exception as e:
-            add_balance(interaction.user.id, price)  # ย้อนเงิน
+            add_balance(interaction.user.id, price)
             return await interaction.followup.send(
                 f"โหลดไฟล์ **{item['name']}** ไม่สำเร็จ: {e}\nคืนเงิน {fmt_thb(price)} ให้แล้ว",
                 ephemeral=True
@@ -279,7 +309,7 @@ class MenuView(View):
         lines = [f"- {r['name']} | {fmt_thb(r['price_cents'])} | {r['created_at']}" for r in rows]
         await interaction.response.send_message("ประวัติการซื้อ 20 รายการล่าสุด:\n" + "\n".join(lines), ephemeral=True)
 
-# -------- Slash Commands (ผู้ใช้) --------
+# ---------- Slash Commands: user ----------
 @bot.tree.command(name="menu", description="เปิดเมนูร้าน")
 async def menu_cmd(interaction: Interaction):
     embed = discord.Embed(
@@ -303,14 +333,15 @@ async def history_cmd(interaction: Interaction):
     lines = [f"- {r['name']} | {fmt_thb(r['price_cents'])} | {r['created_at']}" for r in rows]
     await interaction.response.send_message("ประวัติของคุณ:\n" + "\n".join(lines), ephemeral=True)
 
-# -------- Slash Commands (แอดมิน) --------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
+@bot.tree.command(name="ping", description="ทดสอบบอท")
+async def ping_cmd(interaction: Interaction):
+    await interaction.response.send_message("pong! ✅", ephemeral=True)
 
+# ---------- Slash Commands: admin ----------
 @bot.tree.command(name="admin_add_item", description="(แอดมิน) เพิ่มสินค้า")
 @app_commands.describe(name="ชื่อที่จะแสดง", price_thb="ราคา (บาท)", gdrive_url="ลิงก์ Google Drive", filename="ชื่อไฟล์ .mp4")
 async def admin_add_item(interaction: Interaction, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if not is_admin(interaction.user.id):
+    if not is_admin(interaction):
         return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
     item_id = upsert_item(name=name, price_cents=to_satang(price_thb), gdrive_url=gdrive_url, filename=filename or "video.mp4")
     await interaction.response.send_message(f"เพิ่มสินค้า #{item_id}: **{name}** ราคา {price_thb:.2f} บาท", ephemeral=True)
@@ -318,7 +349,7 @@ async def admin_add_item(interaction: Interaction, name: str, price_thb: float, 
 @bot.tree.command(name="admin_edit_item", description="(แอดมิน) แก้ไขสินค้า")
 @app_commands.describe(item_id="รหัสสินค้า", name="ชื่อใหม่", price_thb="ราคาใหม่ (บาท)", gdrive_url="ลิงก์ใหม่", filename="ไฟล์ .mp4")
 async def admin_edit_item(interaction: Interaction, item_id: int, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if not is_admin(interaction.user.id):
+    if not is_admin(interaction):
         return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
     if not get_item(item_id):
         return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
@@ -328,7 +359,7 @@ async def admin_edit_item(interaction: Interaction, item_id: int, name: str, pri
 @bot.tree.command(name="admin_toggle_item", description="(แอดมิน) เปิด/ปิด การขายสินค้า")
 @app_commands.describe(item_id="รหัสสินค้า", active="เปิดขายหรือไม่")
 async def admin_toggle_item(interaction: Interaction, item_id: int, active: bool):
-    if not is_admin(interaction.user.id):
+    if not is_admin(interaction):
         return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
     if not get_item(item_id):
         return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
@@ -337,7 +368,7 @@ async def admin_toggle_item(interaction: Interaction, item_id: int, active: bool
 
 @bot.tree.command(name="admin_items", description="(แอดมิน) ดูรายการสินค้าทั้งหมด")
 async def admin_items(interaction: Interaction):
-    if not is_admin(interaction.user.id):
+    if not is_admin(interaction):
         return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
     rows = list_items(active_only=False)
     if not rows:
@@ -348,26 +379,54 @@ async def admin_items(interaction: Interaction):
 @bot.tree.command(name="admin_add_balance", description="(แอดมิน) เติมเงินให้ผู้ใช้")
 @app_commands.describe(user="เลือกผู้ใช้", amount_thb="จำนวนเงิน (บาท)")
 async def admin_add_balance(interaction: Interaction, user: discord.User, amount_thb: float):
-    if not is_admin(interaction.user.id):
+    if not is_admin(interaction):
         return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
     add_balance(user.id, to_satang(amount_thb))
     await interaction.response.send_message(f"เติมเงินให้ {user.mention} จำนวน {amount_thb:.2f} บาท แล้ว", ephemeral=True)
 
-# -------------------- STARTUP --------------------
+# ให้ "เจ้าของกิลด์" จัดการสิทธิ์แอดมินเพิ่ม/ลด
+@bot.tree.command(name="admin_grant", description="(เจ้าของกิลด์) เพิ่มสิทธิ์แอดมิน")
+@app_commands.describe(user="ผู้ใช้ที่จะให้สิทธิ์")
+async def admin_grant(interaction: Interaction, user: discord.User):
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("คำสั่งนี้ใช้ได้เฉพาะเจ้าของกิลด์", ephemeral=True)
+    grant_admin(user.id)
+    await interaction.response.send_message(f"ให้สิทธิ์แอดมินแก่ {user.mention} แล้ว", ephemeral=True)
+
+@bot.tree.command(name="admin_revoke", description="(เจ้าของกิลด์) ยกเลิกสิทธิ์แอดมิน")
+@app_commands.describe(user="ผู้ใช้ที่จะยกเลิกสิทธิ์")
+async def admin_revoke(interaction: Interaction, user: discord.User):
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("คำสั่งนี้ใช้ได้เฉพาะเจ้าของกิลด์", ephemeral=True)
+    revoke_admin(user.id)
+    await interaction.response.send_message(f"ยกเลิกสิทธิ์แอดมินของ {user.mention} แล้ว", ephemeral=True)
+
+# ---------- STARTUP ----------
 @bot.event
 async def on_ready():
-    # start web health server (Render)
+    db_init()
+    # start web health server
     bot.loop.create_task(run_web_server())
 
-    db_init()
+    # บังคับ sync คำสั่ง "รายกิลด์" เพื่อให้ใช้งานได้ทันที
+    try:
+        for g in bot.guilds:
+            await bot.tree.sync(guild=g)
+            print(f"Synced commands to guild {g.name} ({g.id})")
+    except Exception as e:
+        print("Guild sync error:", e)
+
+    # เผื่อไว้ sync global ด้วย (ไม่กระทบ ถ้าไม่สำเร็จ)
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands")
+        print(f"Synced {len(synced)} global commands")
     except Exception as e:
-        print("Sync error:", e)
+        print("Global sync error:", e)
+
     print(f"Logged in as {bot.user}")
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise SystemExit("กรุณาตั้งค่า DISCORD_TOKEN ใน Environment Variables")
     bot.run(DISCORD_TOKEN)
+    
