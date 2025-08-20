@@ -3,7 +3,7 @@ import asyncio
 import tempfile
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Literal
 
 import discord
 from discord.ext import commands
@@ -33,7 +33,7 @@ ADMIN_ENV_IDS = {
     *[int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x]
 }
 DB_PATH = os.getenv("DB_PATH", "shopbot.db")
-MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024  # ~24MB
 
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
@@ -86,12 +86,30 @@ def db_init():
                 FOREIGN KEY(item_id) REFERENCES items(id)
             )
         """)
-        # ตารางแอดมินเพิ่มเติม
         c.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 discord_id INTEGER PRIMARY KEY
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # default: shop_open = 1
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('shop_open','1')")
+        conn.commit()
+
+def get_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+def set_setting(key: str, value: str):
+    with db() as conn:
+        conn.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, value))
         conn.commit()
 
 def ensure_user(discord_id: int):
@@ -138,6 +156,12 @@ def upsert_item(name: str, price_cents: int, gdrive_url: str, filename: str = "v
             conn.commit()
             return item_id
 
+def delete_item(item_id: int) -> bool:
+    with db() as conn:
+        cur = conn.execute("DELETE FROM items WHERE id=?", (item_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
 def set_item_active(item_id: int, active: bool):
     with db() as conn:
         conn.execute("UPDATE items SET is_active=? WHERE id=?", (1 if active else 0, item_id))
@@ -162,10 +186,8 @@ def get_my_purchases(discord_id: int, limit: int = 20) -> List[sqlite3.Row]:
 
 # ---------- Admin helpers ----------
 def is_admin_user(user_id: int) -> bool:
-    # จาก ENV
     if user_id in ADMIN_ENV_IDS:
         return True
-    # จากตาราง admins
     with db() as conn:
         row = conn.execute("SELECT 1 FROM admins WHERE discord_id=?", (user_id,)).fetchone()
         if row:
@@ -173,7 +195,6 @@ def is_admin_user(user_id: int) -> bool:
     return False
 
 def is_admin(inter: Interaction) -> bool:
-    # เจ้าของกิลด์เป็นแอดมินเสมอ
     guild_owner_ok = (inter.guild is not None and inter.user.id == inter.guild.owner_id)
     return guild_owner_ok or is_admin_user(inter.user.id)
 
@@ -198,15 +219,34 @@ async def download_drive_to_temp(url_or_id: str, filename_hint: str) -> Tuple[st
         return out, os.path.getsize(out)
     return await asyncio.to_thread(_download)
 
-async def send_video_or_link(user: discord.User, file_path: str, size_bytes: int, fallback_url: str, item_name: str):
+async def deliver(
+    *,
+    user: discord.User,
+    channel: Optional[discord.abc.Messageable],
+    item_name: str,
+    gdrive_url: str,
+    filename: str,
+    method: Literal["file","link"]
+):
+    """ส่งคลิปตาม method และปลายทาง (DM หรือในห้อง)"""
+    target = None
     try:
-        dm = await user.create_dm()
-        if size_bytes <= MAX_UPLOAD_BYTES:
-            await dm.send(content=f"ส่งคลิป **{item_name}** ให้แล้วครับ 🎬",
-                          file=discord.File(file_path))
+        if channel is not None:
+            target = channel
         else:
-            await dm.send(content=(f"ไฟล์ **{item_name}** ขนาด {size_bytes/1024/1024:.1f}MB "
-                                   f"เกินลิมิตอัปโหลดของ Discord ครับ 🙏\nลิงก์ดาวน์โหลด: {fallback_url}"))
+            target = await user.create_dm()
+
+        if method == "link":
+            await target.send(content=f"ลิงก์ดาวน์โหลดสำหรับ **{item_name}**:\n{gdrive_url}")
+            return
+
+        # method == file
+        path, size = await download_drive_to_temp(gdrive_url, filename or "video.mp4")
+        if size <= MAX_UPLOAD_BYTES:
+            await target.send(content=f"ส่งคลิป **{item_name}** ให้แล้วครับ 🎬", file=discord.File(path))
+        else:
+            await target.send(content=(f"ไฟล์ **{item_name}** ขนาด {size/1024/1024:.1f}MB "
+                                       f"เกินลิมิตอัปโหลดของ Discord ครับ 🙏\nลิงก์ดาวน์โหลด: {gdrive_url}"))
     except discord.Forbidden:
         pass
 
@@ -227,6 +267,10 @@ class ShopSelect(Select):
         super().__init__(placeholder="เลือกรายการทั้งหมด", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: Interaction):
+        # ร้านเปิดไหม
+        if get_setting("shop_open","1") != "1":
+            return await interaction.response.send_message("ตอนนี้ร้านปิดชั่วคราว ⛔ กรุณามาใหม่ภายหลัง", ephemeral=True)
+
         item_id = int(self.values[0])
         item = get_item(item_id)
         if not item or not item["is_active"]:
@@ -241,67 +285,90 @@ class ShopSelect(Select):
                 f"ยอดคงเหลือของคุณ: {fmt_thb(bal)}\nโปรดติดต่อแอดมินเพื่อเติมเงินอีก {fmt_thb(need)}",
                 ephemeral=True
             )
+
         await interaction.response.send_message(
-            f"ยืนยันซื้อ **{item['name']}** ราคา {fmt_thb(price)} ?",
+            f"ยืนยันซื้อ **{item['name']}** ราคา {fmt_thb(price)} ?\n"
+            f"เลือกรูปแบบการส่งและปลายทางด้านล่าง👇",
             view=ConfirmBuyView(item_id=item_id),
             ephemeral=True
         )
 
 class ConfirmBuyView(View):
     def __init__(self, item_id: int):
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.item_id = item_id
 
-    @discord.ui.button(label="ยืนยันซื้อ", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: Interaction, button: Button):
+    async def _handle(self, interaction: Interaction, method: Literal["file","link"], dest: Literal["dm","channel"]):
         item = get_item(self.item_id)
         if not item or not item["is_active"]:
             return await interaction.response.edit_message(content="รายการนี้ไม่พร้อมจำหน่ายแล้วครับ", view=None)
 
+        # ร้านเปิดไหม
+        if get_setting("shop_open","1") != "1":
+            return await interaction.response.edit_message(content="ตอนนี้ร้านปิดชั่วคราว ⛔", view=None)
+
         price = item["price_cents"]
         bal = get_balance(interaction.user.id)
         if bal < price:
-            return await interaction.response.edit_message(
-                content=f"ยอดเงินไม่พอ (ต้องการ {fmt_thb(price)} คงเหลือ {fmt_thb(bal)})", view=None
-            )
+            return await interaction.response.edit_message(content="ยอดเงินไม่พอ", view=None)
 
-        await interaction.response.edit_message(content="กำลังเตรียมไฟล์ให้คุณ... ⏳", view=None)
+        await interaction.response.edit_message(content="กำลังเตรียมให้คุณ... ⏳", view=None)
         add_purchase(interaction.user.id, item["id"], price)
 
-        try:
-            path, size = await download_drive_to_temp(item["gdrive_url"], item["filename"] or "video.mp4")
-        except Exception as e:
-            add_balance(interaction.user.id, price)
-            return await interaction.followup.send(
-                f"โหลดไฟล์ **{item['name']}** ไม่สำเร็จ: {e}\nคืนเงิน {fmt_thb(price)} ให้แล้ว",
-                ephemeral=True
-            )
+        channel = interaction.channel if dest == "channel" else None
+        await deliver(
+            user=interaction.user,
+            channel=channel,
+            item_name=item["name"],
+            gdrive_url=item["gdrive_url"],
+            filename=item["filename"] or "video.mp4",
+            method=method
+        )
 
-        await send_video_or_link(interaction.user, path, size, item["gdrive_url"], item["name"])
+        where_txt = "ในห้องนี้" if dest=="channel" else "ทาง DM"
+        how_txt = "เป็นไฟล์" if method=="file" else "เป็นลิงก์"
         await interaction.followup.send(
-            f"ซื้อ **{item['name']}** เสร็จสิ้น ✅\n"
-            f"ราคา {fmt_thb(price)} | ยอดคงเหลือ: {fmt_thb(get_balance(interaction.user.id))}\n"
-            f"ส่งคลิปให้ทาง DM แล้วครับ 🎬",
+            f"ซื้อ **{item['name']}** เสร็จสิ้น ✅ | ราคา {fmt_thb(price)}\n"
+            f"ได้ทำการส่ง {how_txt} {where_txt} แล้วครับ 🎬\n"
+            f"ยอดคงเหลือ: {fmt_thb(get_balance(interaction.user.id))}",
             ephemeral=True
         )
 
-    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: Interaction, button: Button):
-        await interaction.response.edit_message(content="ยกเลิกการซื้อแล้วครับ", view=None)
+    # 4 ปุ่ม: (ไฟล์/ลิงก์) x (DM/ห้อง)
+    @discord.ui.button(label="ส่งเป็นไฟล์ + DM", style=discord.ButtonStyle.success)
+    async def file_dm(self, interaction: Interaction, button: Button):
+        await self._handle(interaction, "file", "dm")
+
+    @discord.ui.button(label="ส่งเป็นไฟล์ + ในห้องนี้", style=discord.ButtonStyle.success)
+    async def file_chan(self, interaction: Interaction, button: Button):
+        await self._handle(interaction, "file", "channel")
+
+    @discord.ui.button(label="ส่งเป็นลิงก์ + DM", style=discord.ButtonStyle.primary)
+    async def link_dm(self, interaction: Interaction, button: Button):
+        await self._handle(interaction, "link", "dm")
+
+    @discord.ui.button(label="ส่งเป็นลิงก์ + ในห้องนี้", style=discord.ButtonStyle.primary)
+    async def link_chan(self, interaction: Interaction, button: Button):
+        await self._handle(interaction, "link", "channel")
 
 class MenuView(View):
     def __init__(self):
-        super().__init__(timeout=180)
+        super().__init__(timeout=300)
         self.add_item(ShopSelect())
 
-    @discord.ui.button(emoji="💰", label="เช็คยอดเงิน", style=discord.ButtonStyle.primary)
+    @discord.ui.button(emoji="🔄", label="รีเซ็ตเมนู", style=discord.ButtonStyle.secondary)
+    async def reset_btn(self, interaction: Interaction, button: Button):
+        # แทนที่วิวเดิมด้วยของใหม่ เพื่อคลายอาการค้าง
+        await interaction.response.edit_message(content="เมนูรีเฟรชแล้ว ✅", view=MenuView())
+
+    @discord.ui.button(emoji="💰", label="เช็คยอดเงิน", style=discord.ButtonStyle.secondary)
     async def balance_btn(self, interaction: Interaction, button: Button):
         await interaction.response.send_message(
             f"ยอดคงเหลือของคุณ: **{fmt_thb(get_balance(interaction.user.id))}**",
             ephemeral=True
         )
 
-    @discord.ui.button(emoji="🧾", label="ประวัติการซื้อ", style=discord.ButtonStyle.blurple)
+    @discord.ui.button(emoji="🧾", label="ประวัติการซื้อ", style=discord.ButtonStyle.secondary)
     async def history_btn(self, interaction: Interaction, button: Button):
         rows = get_my_purchases(interaction.user.id, limit=20)
         if not rows:
@@ -310,13 +377,19 @@ class MenuView(View):
         await interaction.response.send_message("ประวัติการซื้อ 20 รายการล่าสุด:\n" + "\n".join(lines), ephemeral=True)
 
 # ---------- Slash Commands: user ----------
-@bot.tree.command(name="menu", description="เปิดเมนูร้าน")
+@bot.tree.command(name="menu", description="เปิดเมนูร้าน (สาธารณะ)")
 async def menu_cmd(interaction: Interaction):
-    embed = discord.Embed(
-        title="[ รายการทั้งหมด ]",
-        description="เลือกจากเมนูด้านล่างได้เลยครับ",
-        color=discord.Color.dark_embed()
-    )
+    title = "[ ร้านเปิดให้บริการ ]" if get_setting("shop_open","1")=="1" else "[ ร้านปิดชั่วคราว ]"
+    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if get_setting("shop_open","1")=="1" else "ยังไม่เปิดขายในตอนนี้"
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
+    # ส่งแบบ "ทุกคนเห็น" (non-ephemeral)
+    await interaction.response.send_message(embed=embed, view=MenuView(), ephemeral=False)
+
+@bot.tree.command(name="menu_private", description="เปิดเมนูร้าน (เห็นคนเดียว)")
+async def menu_private_cmd(interaction: Interaction):
+    title = "[ ร้านเปิดให้บริการ ]" if get_setting("shop_open","1")=="1" else "[ ร้านปิดชั่วคราว ]"
+    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if get_setting("shop_open","1")=="1" else "ยังไม่เปิดขายในตอนนี้"
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed, view=MenuView(), ephemeral=True)
 
 @bot.tree.command(name="balance", description="เช็คยอดเงินของฉัน")
@@ -338,95 +411,44 @@ async def ping_cmd(interaction: Interaction):
     await interaction.response.send_message("pong! ✅", ephemeral=True)
 
 # ---------- Slash Commands: admin ----------
+def require_admin(inter: Interaction) -> Optional[str]:
+    if not is_admin(inter):
+        return "ต้องเป็นแอดมินเท่านั้น"
+    return None
+
 @bot.tree.command(name="admin_add_item", description="(แอดมิน) เพิ่มสินค้า")
 @app_commands.describe(name="ชื่อที่จะแสดง", price_thb="ราคา (บาท)", gdrive_url="ลิงก์ Google Drive", filename="ชื่อไฟล์ .mp4")
 async def admin_add_item(interaction: Interaction, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if not is_admin(interaction):
-        return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
+    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
     item_id = upsert_item(name=name, price_cents=to_satang(price_thb), gdrive_url=gdrive_url, filename=filename or "video.mp4")
     await interaction.response.send_message(f"เพิ่มสินค้า #{item_id}: **{name}** ราคา {price_thb:.2f} บาท", ephemeral=True)
 
 @bot.tree.command(name="admin_edit_item", description="(แอดมิน) แก้ไขสินค้า")
 @app_commands.describe(item_id="รหัสสินค้า", name="ชื่อใหม่", price_thb="ราคาใหม่ (บาท)", gdrive_url="ลิงก์ใหม่", filename="ไฟล์ .mp4")
 async def admin_edit_item(interaction: Interaction, item_id: int, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if not is_admin(interaction):
-        return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
-    if not get_item(item_id):
-        return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
+    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
+    if not get_item(item_id): return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
     upsert_item(name=name, price_cents=to_satang(price_thb), gdrive_url=gdrive_url, filename=filename or "video.mp4", item_id=item_id)
     await interaction.response.send_message(f"แก้ไขสินค้า #{item_id} เรียบร้อย", ephemeral=True)
 
-@bot.tree.command(name="admin_toggle_item", description="(แอดมิน) เปิด/ปิด การขายสินค้า")
+@bot.tree.command(name="admin_delete_item", description="(แอดมิน) ลบสินค้า")
+@app_commands.describe(item_id="รหัสสินค้า")
+async def admin_delete_item(interaction: Interaction, item_id: int):
+    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
+    ok = delete_item(item_id)
+    await interaction.response.send_message("ลบเรียบร้อย" if ok else "ไม่พบสินค้า", ephemeral=True)
+
+@bot.tree.command(name="admin_toggle_item", description="(แอดมิน) เปิด/ปิด การขายสินค้า (รายชิ้น)")
 @app_commands.describe(item_id="รหัสสินค้า", active="เปิดขายหรือไม่")
 async def admin_toggle_item(interaction: Interaction, item_id: int, active: bool):
-    if not is_admin(interaction):
-        return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
-    if not get_item(item_id):
-        return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
+    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
+    if not get_item(item_id): return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
     set_item_active(item_id, active)
     await interaction.response.send_message(f"{'เปิด' if active else 'ปิด'}การขายสินค้ารหัส #{item_id} แล้ว", ephemeral=True)
 
 @bot.tree.command(name="admin_items", description="(แอดมิน) ดูรายการสินค้าทั้งหมด")
 async def admin_items(interaction: Interaction):
-    if not is_admin(interaction):
-        return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
+    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
     rows = list_items(active_only=False)
-    if not rows:
-        return await interaction.response.send_message("ยังไม่มีสินค้า", ephemeral=True)
-    lines = [f"#{r['id']} | {'ON' if r['is_active'] else 'OFF'} | {r['name']} | {fmt_thb(r['price_cents'])}" for r in rows]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-@bot.tree.command(name="admin_add_balance", description="(แอดมิน) เติมเงินให้ผู้ใช้")
-@app_commands.describe(user="เลือกผู้ใช้", amount_thb="จำนวนเงิน (บาท)")
-async def admin_add_balance(interaction: Interaction, user: discord.User, amount_thb: float):
-    if not is_admin(interaction):
-        return await interaction.response.send_message("ต้องเป็นแอดมินเท่านั้น", ephemeral=True)
-    add_balance(user.id, to_satang(amount_thb))
-    await interaction.response.send_message(f"เติมเงินให้ {user.mention} จำนวน {amount_thb:.2f} บาท แล้ว", ephemeral=True)
-
-# ให้ "เจ้าของกิลด์" จัดการสิทธิ์แอดมินเพิ่ม/ลด
-@bot.tree.command(name="admin_grant", description="(เจ้าของกิลด์) เพิ่มสิทธิ์แอดมิน")
-@app_commands.describe(user="ผู้ใช้ที่จะให้สิทธิ์")
-async def admin_grant(interaction: Interaction, user: discord.User):
-    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("คำสั่งนี้ใช้ได้เฉพาะเจ้าของกิลด์", ephemeral=True)
-    grant_admin(user.id)
-    await interaction.response.send_message(f"ให้สิทธิ์แอดมินแก่ {user.mention} แล้ว", ephemeral=True)
-
-@bot.tree.command(name="admin_revoke", description="(เจ้าของกิลด์) ยกเลิกสิทธิ์แอดมิน")
-@app_commands.describe(user="ผู้ใช้ที่จะยกเลิกสิทธิ์")
-async def admin_revoke(interaction: Interaction, user: discord.User):
-    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("คำสั่งนี้ใช้ได้เฉพาะเจ้าของกิลด์", ephemeral=True)
-    revoke_admin(user.id)
-    await interaction.response.send_message(f"ยกเลิกสิทธิ์แอดมินของ {user.mention} แล้ว", ephemeral=True)
-
-# ---------- STARTUP ----------
-@bot.event
-async def on_ready():
-    db_init()
-    # start web health server
-    bot.loop.create_task(run_web_server())
-
-    # บังคับ sync คำสั่ง "รายกิลด์" เพื่อให้ใช้งานได้ทันที
-    try:
-        for g in bot.guilds:
-            await bot.tree.sync(guild=g)
-            print(f"Synced commands to guild {g.name} ({g.id})")
-    except Exception as e:
-        print("Guild sync error:", e)
-
-    # เผื่อไว้ sync global ด้วย (ไม่กระทบ ถ้าไม่สำเร็จ)
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} global commands")
-    except Exception as e:
-        print("Global sync error:", e)
-
-    print(f"Logged in as {bot.user}")
-
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise SystemExit("กรุณาตั้งค่า DISCORD_TOKEN ใน Environment Variables")
-    bot.run(DISCORD_TOKEN)
-    
+    if not rows: return await interaction.response.send_message("ยังไม่มีสินค้า", ephemeral=True)
+    lines = [f"#{r['id']} | {'ON' if r['is
