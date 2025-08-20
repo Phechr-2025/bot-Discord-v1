@@ -108,8 +108,11 @@ def get_setting(key: str, default: str = "") -> str:
 
 def set_setting(key: str, value: str):
     with db() as conn:
-        conn.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (key, value))
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
         conn.commit()
 
 def ensure_user(discord_id: int):
@@ -126,11 +129,13 @@ def get_balance(discord_id: int) -> int:
 def add_balance(discord_id: int, cents: int):
     ensure_user(discord_id)
     with db() as conn:
-        conn.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE discord_id=?",
-                     (cents, discord_id))
+        conn.execute(
+            "UPDATE users SET balance_cents = balance_cents + ? WHERE discord_id=?",
+            (cents, discord_id),
+        )
         conn.commit()
 
-def list_items(active_only=True) -> List[sqlite3.Row]:
+def list_items(active_only: bool = True) -> List[sqlite3.Row]:
     q = "SELECT * FROM items" + (" WHERE is_active=1" if active_only else "")
     with db() as conn:
         return list(conn.execute(q).fetchall())
@@ -139,20 +144,27 @@ def get_item(item_id: int) -> Optional[sqlite3.Row]:
     with db() as conn:
         return conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
 
-def upsert_item(name: str, price_cents: int, gdrive_url: str, filename: str = "video.mp4",
-                item_id: Optional[int] = None) -> int:
+def upsert_item(
+    name: str,
+    price_cents: int,
+    gdrive_url: str,
+    filename: str = "video.mp4",
+    item_id: Optional[int] = None,
+) -> int:
     with db() as conn:
         cur = conn.cursor()
         if item_id is None:
-            cur.execute("""INSERT INTO items (name, price_cents, gdrive_url, filename, is_active)
-                           VALUES (?,?,?,?,1)""",
-                        (name, price_cents, gdrive_url, filename))
+            cur.execute(
+                "INSERT INTO items (name, price_cents, gdrive_url, filename, is_active) VALUES (?,?,?,?,1)",
+                (name, price_cents, gdrive_url, filename),
+            )
             conn.commit()
             return cur.lastrowid
         else:
-            cur.execute("""UPDATE items SET name=?, price_cents=?, gdrive_url=?, filename=?
-                           WHERE id=?""",
-                        (name, price_cents, gdrive_url, filename, item_id))
+            cur.execute(
+                "UPDATE items SET name=?, price_cents=?, gdrive_url=?, filename=? WHERE id=?",
+                (name, price_cents, gdrive_url, filename, item_id),
+            )
             conn.commit()
             return item_id
 
@@ -169,20 +181,28 @@ def set_item_active(item_id: int, active: bool):
 
 def add_purchase(discord_id: int, item_id: int, price_cents: int):
     with db() as conn:
-        conn.execute("""INSERT INTO purchases (discord_id, item_id, price_cents, created_at)
-                        VALUES (?,?,?,?)""",
-                     (discord_id, item_id, price_cents, now_utc_iso()))
-        conn.execute("""UPDATE users SET balance_cents = balance_cents - ?
-                        WHERE discord_id=?""", (price_cents, discord_id))
+        conn.execute(
+            "INSERT INTO purchases (discord_id, item_id, price_cents, created_at) VALUES (?,?,?,?)",
+            (discord_id, item_id, price_cents, now_utc_iso()),
+        )
+        conn.execute(
+            "UPDATE users SET balance_cents = balance_cents - ? WHERE discord_id=?",
+            (price_cents, discord_id),
+        )
         conn.commit()
 
 def get_my_purchases(discord_id: int, limit: int = 20) -> List[sqlite3.Row]:
     with db() as conn:
-        return list(conn.execute("""
-            SELECT p.id, p.created_at, p.price_cents, i.name
-            FROM purchases p JOIN items i ON p.item_id=i.id
-            WHERE p.discord_id=? ORDER BY p.id DESC LIMIT ?
-        """, (discord_id, limit)).fetchall())
+        return list(
+            conn.execute(
+                """
+                SELECT p.id, p.created_at, p.price_cents, i.name
+                FROM purchases p JOIN items i ON p.item_id=i.id
+                WHERE p.discord_id=? ORDER BY p.id DESC LIMIT ?
+                """,
+                (discord_id, limit),
+            ).fetchall()
+        )
 
 # ---------- Admin helpers ----------
 def is_admin_user(user_id: int) -> bool:
@@ -195,7 +215,7 @@ def is_admin_user(user_id: int) -> bool:
     return False
 
 def is_admin(inter: Interaction) -> bool:
-    guild_owner_ok = (inter.guild is not None and inter.user.id == inter.guild.owner_id)
+    guild_owner_ok = inter.guild is not None and inter.user.id == inter.guild.owner_id
     return guild_owner_ok or is_admin_user(inter.user.id)
 
 def grant_admin(user_id: int):
@@ -208,15 +228,18 @@ def revoke_admin(user_id: int):
         conn.execute("DELETE FROM admins WHERE discord_id=?", (user_id,))
         conn.commit()
 
-# ---------- DOWNLOAD ----------
+# ---------- DOWNLOAD / DELIVERY ----------
 async def download_drive_to_temp(url_or_id: str, filename_hint: str) -> Tuple[str, int]:
     def _download() -> Tuple[str, int]:
         tmpdir = tempfile.mkdtemp(prefix="shopclip_")
-        out = os.path.join(tmpdir, filename_hint if filename_hint.endswith(".mp4")
-                           else f"{filename_hint}.mp4")
+        out = os.path.join(
+            tmpdir,
+            filename_hint if filename_hint.endswith(".mp4") else f"{filename_hint}.mp4",
+        )
         # ต้องแชร์ไฟล์เป็น Anyone with the link
         gdown.download(url_or_id, out, quiet=True, fuzzy=True)
         return out, os.path.getsize(out)
+
     return await asyncio.to_thread(_download)
 
 async def deliver(
@@ -226,29 +249,29 @@ async def deliver(
     item_name: str,
     gdrive_url: str,
     filename: str,
-    method: Literal["file","link"]
+    method: Literal["file", "link"],
 ):
     """ส่งคลิปตาม method และปลายทาง (DM หรือในห้อง)"""
-    target = None
-    try:
-        if channel is not None:
-            target = channel
-        else:
-            target = await user.create_dm()
+    target = channel if channel is not None else await user.create_dm()
 
-        if method == "link":
-            await target.send(content=f"ลิงก์ดาวน์โหลดสำหรับ **{item_name}**:\n{gdrive_url}")
-            return
+    if method == "link":
+        await target.send(content=f"ลิงก์ดาวน์โหลดสำหรับ **{item_name}**:\n{gdrive_url}")
+        return
 
-        # method == file
-        path, size = await download_drive_to_temp(gdrive_url, filename or "video.mp4")
-        if size <= MAX_UPLOAD_BYTES:
-            await target.send(content=f"ส่งคลิป **{item_name}** ให้แล้วครับ 🎬", file=discord.File(path))
-        else:
-            await target.send(content=(f"ไฟล์ **{item_name}** ขนาด {size/1024/1024:.1f}MB "
-                                       f"เกินลิมิตอัปโหลดของ Discord ครับ 🙏\nลิงก์ดาวน์โหลด: {gdrive_url}"))
-    except discord.Forbidden:
-        pass
+    # method == file
+    path, size = await download_drive_to_temp(gdrive_url, filename or "video.mp4")
+    if size <= MAX_UPLOAD_BYTES:
+        await target.send(
+            content=f"ส่งคลิป **{item_name}** ให้แล้วครับ 🎬",
+            file=discord.File(path),
+        )
+    else:
+        await target.send(
+            content=(
+                f"ไฟล์ **{item_name}** ขนาด {size/1024/1024:.1f}MB "
+                f"เกินลิมิตอัปโหลดของ Discord ครับ 🙏\nลิงก์ดาวน์โหลด: {gdrive_url}"
+            )
+        )
 
 # ---------- UI ----------
 class ShopSelect(Select):
@@ -257,18 +280,21 @@ class ShopSelect(Select):
         if not rows:
             super().__init__(placeholder="ยังไม่มีรายการจำหน่าย", options=[], disabled=True)
             return
+
         options = []
         for r in rows:
-            options.append(discord.SelectOption(
-                label=r["name"][:100],
-                value=str(r["id"]),
-                description=f"ราคา {fmt_thb(r['price_cents'])}"
-            ))
+            options.append(
+                discord.SelectOption(
+                    label=r["name"][:100],
+                    value=str(r["id"]),
+                    description=f"ราคา {fmt_thb(r['price_cents'])}",
+                )
+            )
         super().__init__(placeholder="เลือกรายการทั้งหมด", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: Interaction):
         # ร้านเปิดไหม
-        if get_setting("shop_open","1") != "1":
+        if get_setting("shop_open", "1") != "1":
             return await interaction.response.send_message("ตอนนี้ร้านปิดชั่วคราว ⛔ กรุณามาใหม่ภายหลัง", ephemeral=True)
 
         item_id = int(self.values[0])
@@ -283,14 +309,14 @@ class ShopSelect(Select):
             return await interaction.response.send_message(
                 f"ยอดเงินของคุณไม่พอสำหรับ **{item['name']}** (ต้องการ {fmt_thb(price)})\n"
                 f"ยอดคงเหลือของคุณ: {fmt_thb(bal)}\nโปรดติดต่อแอดมินเพื่อเติมเงินอีก {fmt_thb(need)}",
-                ephemeral=True
+                ephemeral=True,
             )
 
         await interaction.response.send_message(
             f"ยืนยันซื้อ **{item['name']}** ราคา {fmt_thb(price)} ?\n"
             f"เลือกรูปแบบการส่งและปลายทางด้านล่าง👇",
             view=ConfirmBuyView(item_id=item_id),
-            ephemeral=True
+            ephemeral=True,  # ยืนยันส่วนตัว กันสแปมหน้าห้อง
         )
 
 class ConfirmBuyView(View):
@@ -298,13 +324,13 @@ class ConfirmBuyView(View):
         super().__init__(timeout=120)
         self.item_id = item_id
 
-    async def _handle(self, interaction: Interaction, method: Literal["file","link"], dest: Literal["dm","channel"]):
+    async def _handle(self, interaction: Interaction, method: Literal["file", "link"], dest: Literal["dm", "channel"]):
         item = get_item(self.item_id)
         if not item or not item["is_active"]:
             return await interaction.response.edit_message(content="รายการนี้ไม่พร้อมจำหน่ายแล้วครับ", view=None)
 
         # ร้านเปิดไหม
-        if get_setting("shop_open","1") != "1":
+        if get_setting("shop_open", "1") != "1":
             return await interaction.response.edit_message(content="ตอนนี้ร้านปิดชั่วคราว ⛔", view=None)
 
         price = item["price_cents"]
@@ -322,16 +348,16 @@ class ConfirmBuyView(View):
             item_name=item["name"],
             gdrive_url=item["gdrive_url"],
             filename=item["filename"] or "video.mp4",
-            method=method
+            method=method,
         )
 
-        where_txt = "ในห้องนี้" if dest=="channel" else "ทาง DM"
-        how_txt = "เป็นไฟล์" if method=="file" else "เป็นลิงก์"
+        where_txt = "ในห้องนี้" if dest == "channel" else "ทาง DM"
+        how_txt = "เป็นไฟล์" if method == "file" else "เป็นลิงก์"
         await interaction.followup.send(
             f"ซื้อ **{item['name']}** เสร็จสิ้น ✅ | ราคา {fmt_thb(price)}\n"
             f"ได้ทำการส่ง {how_txt} {where_txt} แล้วครับ 🎬\n"
             f"ยอดคงเหลือ: {fmt_thb(get_balance(interaction.user.id))}",
-            ephemeral=True
+            ephemeral=True,
         )
 
     # 4 ปุ่ม: (ไฟล์/ลิงก์) x (DM/ห้อง)
@@ -358,14 +384,14 @@ class MenuView(View):
 
     @discord.ui.button(emoji="🔄", label="รีเซ็ตเมนู", style=discord.ButtonStyle.secondary)
     async def reset_btn(self, interaction: Interaction, button: Button):
-        # แทนที่วิวเดิมด้วยของใหม่ เพื่อคลายอาการค้าง
+        # รีเฟรชวิวให้ใหม่ (กันอาการค้าง)
         await interaction.response.edit_message(content="เมนูรีเฟรชแล้ว ✅", view=MenuView())
 
     @discord.ui.button(emoji="💰", label="เช็คยอดเงิน", style=discord.ButtonStyle.secondary)
     async def balance_btn(self, interaction: Interaction, button: Button):
         await interaction.response.send_message(
             f"ยอดคงเหลือของคุณ: **{fmt_thb(get_balance(interaction.user.id))}**",
-            ephemeral=True
+            ephemeral=True,
         )
 
     @discord.ui.button(emoji="🧾", label="ประวัติการซื้อ", style=discord.ButtonStyle.secondary)
@@ -379,16 +405,18 @@ class MenuView(View):
 # ---------- Slash Commands: user ----------
 @bot.tree.command(name="menu", description="เปิดเมนูร้าน (สาธารณะ)")
 async def menu_cmd(interaction: Interaction):
-    title = "[ ร้านเปิดให้บริการ ]" if get_setting("shop_open","1")=="1" else "[ ร้านปิดชั่วคราว ]"
-    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if get_setting("shop_open","1")=="1" else "ยังไม่เปิดขายในตอนนี้"
+    is_open = get_setting("shop_open", "1") == "1"
+    title = "[ ร้านเปิดให้บริการ ]" if is_open else "[ ร้านปิดชั่วคราว ]"
+    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if is_open else "ยังไม่เปิดขายในตอนนี้"
     embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
-    # ส่งแบบ "ทุกคนเห็น" (non-ephemeral)
+    # ส่งแบบสาธารณะ (ทุกคนเห็น)
     await interaction.response.send_message(embed=embed, view=MenuView(), ephemeral=False)
 
 @bot.tree.command(name="menu_private", description="เปิดเมนูร้าน (เห็นคนเดียว)")
 async def menu_private_cmd(interaction: Interaction):
-    title = "[ ร้านเปิดให้บริการ ]" if get_setting("shop_open","1")=="1" else "[ ร้านปิดชั่วคราว ]"
-    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if get_setting("shop_open","1")=="1" else "ยังไม่เปิดขายในตอนนี้"
+    is_open = get_setting("shop_open", "1") == "1"
+    title = "[ ร้านเปิดให้บริการ ]" if is_open else "[ ร้านปิดชั่วคราว ]"
+    desc = "เลือกจากเมนูด้านล่างได้เลยครับ" if is_open else "ยังไม่เปิดขายในตอนนี้"
     embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed, view=MenuView(), ephemeral=True)
 
@@ -412,43 +440,72 @@ async def ping_cmd(interaction: Interaction):
 
 # ---------- Slash Commands: admin ----------
 def require_admin(inter: Interaction) -> Optional[str]:
-    if not is_admin(inter):
-        return "ต้องเป็นแอดมินเท่านั้น"
-    return None
+    return None if is_admin(inter) else "ต้องเป็นแอดมินเท่านั้น"
 
 @bot.tree.command(name="admin_add_item", description="(แอดมิน) เพิ่มสินค้า")
-@app_commands.describe(name="ชื่อที่จะแสดง", price_thb="ราคา (บาท)", gdrive_url="ลิงก์ Google Drive", filename="ชื่อไฟล์ .mp4")
-async def admin_add_item(interaction: Interaction, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
+@app_commands.describe(
+    name="ชื่อที่จะแสดง",
+    price_thb="ราคา (บาท)",
+    gdrive_url="ลิงก์ Google Drive",
+    filename="ชื่อไฟล์ .mp4",
+)
+async def admin_add_item(
+    interaction: Interaction,
+    name: str,
+    price_thb: float,
+    gdrive_url: str,
+    filename: Optional[str] = "video.mp4",
+):
+    msg = require_admin(interaction)
+    if msg:
+        return await interaction.response.send_message(msg, ephemeral=True)
     item_id = upsert_item(name=name, price_cents=to_satang(price_thb), gdrive_url=gdrive_url, filename=filename or "video.mp4")
     await interaction.response.send_message(f"เพิ่มสินค้า #{item_id}: **{name}** ราคา {price_thb:.2f} บาท", ephemeral=True)
 
 @bot.tree.command(name="admin_edit_item", description="(แอดมิน) แก้ไขสินค้า")
-@app_commands.describe(item_id="รหัสสินค้า", name="ชื่อใหม่", price_thb="ราคาใหม่ (บาท)", gdrive_url="ลิงก์ใหม่", filename="ไฟล์ .mp4")
-async def admin_edit_item(interaction: Interaction, item_id: int, name: str, price_thb: float, gdrive_url: str, filename: Optional[str] = "video.mp4"):
-    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
-    if not get_item(item_id): return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
+@app_commands.describe(
+    item_id="รหัสสินค้า",
+    name="ชื่อใหม่",
+    price_thb="ราคาใหม่ (บาท)",
+    gdrive_url="ลิงก์ใหม่",
+    filename="ไฟล์ .mp4",
+)
+async def admin_edit_item(
+    interaction: Interaction,
+    item_id: int,
+    name: str,
+    price_thb: float,
+    gdrive_url: str,
+    filename: Optional[str] = "video.mp4",
+):
+    msg = require_admin(interaction)
+    if msg:
+        return await interaction.response.send_message(msg, ephemeral=True)
+    if not get_item(item_id):
+        return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
     upsert_item(name=name, price_cents=to_satang(price_thb), gdrive_url=gdrive_url, filename=filename or "video.mp4", item_id=item_id)
     await interaction.response.send_message(f"แก้ไขสินค้า #{item_id} เรียบร้อย", ephemeral=True)
 
 @bot.tree.command(name="admin_delete_item", description="(แอดมิน) ลบสินค้า")
 @app_commands.describe(item_id="รหัสสินค้า")
 async def admin_delete_item(interaction: Interaction, item_id: int):
-    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
+    msg = require_admin(interaction)
+    if msg:
+        return await interaction.response.send_message(msg, ephemeral=True)
     ok = delete_item(item_id)
     await interaction.response.send_message("ลบเรียบร้อย" if ok else "ไม่พบสินค้า", ephemeral=True)
 
 @bot.tree.command(name="admin_toggle_item", description="(แอดมิน) เปิด/ปิด การขายสินค้า (รายชิ้น)")
 @app_commands.describe(item_id="รหัสสินค้า", active="เปิดขายหรือไม่")
 async def admin_toggle_item(interaction: Interaction, item_id: int, active: bool):
-    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
-    if not get_item(item_id): return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
+    msg = require_admin(interaction)
+    if msg:
+        return await interaction.response.send_message(msg, ephemeral=True)
+    if not get_item(item_id):
+        return await interaction.response.send_message("ไม่พบสินค้า", ephemeral=True)
     set_item_active(item_id, active)
     await interaction.response.send_message(f"{'เปิด' if active else 'ปิด'}การขายสินค้ารหัส #{item_id} แล้ว", ephemeral=True)
 
 @bot.tree.command(name="admin_items", description="(แอดมิน) ดูรายการสินค้าทั้งหมด")
 async def admin_items(interaction: Interaction):
-    if (msg := require_admin(interaction)): return await interaction.response.send_message(msg, ephemeral=True)
-    rows = list_items(active_only=False)
-    if not rows: return await interaction.response.send_message("ยังไม่มีสินค้า", ephemeral=True)
-    lines = [f"#{r['id']} | {'ON' if r['is
+    msg = require_admin(in
