@@ -2,14 +2,14 @@ services:
   - type: web
     name: discord-bot-web
     env: python
-    plan: free                # เปลี่ยนเป็น starter/standard ได้
+    plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot.py"
     healthCheckPath: "/"
     autoDeploy: true
     envVars:
       - key: DISCORD_TOKEN
-        sync: false           # ใส่ค่าใน Dashboard เอง
+        sync: false
       - key: ADMIN_USER_IDS
-        sync: false           # เช่น 123,456
+        sync: false
         
